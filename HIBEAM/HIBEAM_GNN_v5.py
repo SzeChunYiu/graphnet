@@ -837,7 +837,13 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     dataset = ParquetDataset(path=data_dir, pulsemaps=["pulses"], truth_table="truth",
                              features=features, truth=truth, graph_definition=graph_definition,
                              index_column="event_id")
-    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
+    loader = PyGDataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        persistent_workers=NUM_WORKERS > 0,
+    )
 
     # train LTB if not ready
     if not hasattr(model, "edge_head"):
@@ -1183,7 +1189,13 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
         graph_definition=graph_definition,
         index_column="event_id",
     )
-    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
+    loader = PyGDataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        persistent_workers=NUM_WORKERS > 0,
+    )
 
     ms_cfg = model.multiscale_cfg
     preds_rows, cands_rows, tracks_rows = [], [], []
