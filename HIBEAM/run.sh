@@ -1,0 +1,3 @@
+conda activate GNN_GPU
+python run_signal_compton_toy_generation.py
+python HIBEAM_GNN_v5.py
