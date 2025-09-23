@@ -53,12 +53,11 @@ from hibeam_det import HIBEAM_Detector
 BATCH_SIZE = 64
 MAX_EPOCHS = 1 #30
 GPUS = [0]         # []=CPU, [0] 用第一張 GPU
-NUM_WORKERS = 0    # 資料讀取進程數（0=單線程，可避免 multiprocessing 卡住）
 USE_TIME = True    # 使用 dom_t 特徵
 AUTO_VIZ = False   # 訓練+推論之後，是否自動畫圖（XY/ZY）
 N_VIZ_EACH = 20    # 每個 res_tag 隨機可視化的事件數
 
-# ROI 用於 signal 標記（保持 v3）
+# ROI 用於 signal 標記（保持 v3） ### can change?!
 ROI_XY = (0.0, 0.0)
 ROI_Z_MIN, ROI_Z_MAX = -0.04, 0.04
 ROI_R_TRAIN = 0.2  # 20 cm
@@ -619,12 +618,15 @@ def train_and_eval_for_dir(
         },
         train_dataloader_kwargs={
             "batch_size": BATCH_SIZE,
-            "num_workers": NUM_WORKERS,
-            "persistent_workers": NUM_WORKERS > 0,
+            "num_workers": 2,
+            "persistent_workers": False,
             "pin_memory": False,
             "shuffle": True,
         },
     )
+
+    train_loader = dm.train_dataloader
+    val_loader = dm.val_dataloader
 
     model = MultiTrackModel(
         graph_definition=graph_definition,
@@ -645,7 +647,7 @@ def train_and_eval_for_dir(
         enable_checkpointing=False,
         deterministic=False,
     )
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, train_loader, val_loader)
 
     # --------- Prediction（event/candidate/track 三表） ---------
     inference_and_export_tracks(model, pred_dir, out_dir=out_root/"event_level_information/", use_time=use_time, graph_definition=graph_definition)
@@ -713,13 +715,7 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
         graph_definition=graph_definition,
         index_column="event_id",
     )
-    loader = PyGDataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        persistent_workers=NUM_WORKERS > 0,
-    )
+    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
 
     ms_cfg = model.multiscale_cfg
 
@@ -837,13 +833,7 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     dataset = ParquetDataset(path=data_dir, pulsemaps=["pulses"], truth_table="truth",
                              features=features, truth=truth, graph_definition=graph_definition,
                              index_column="event_id")
-    loader = PyGDataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        persistent_workers=NUM_WORKERS > 0,
-    )
+    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
 
     # train LTB if not ready
     if not hasattr(model, "edge_head"):
@@ -1189,13 +1179,7 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
         graph_definition=graph_definition,
         index_column="event_id",
     )
-    loader = PyGDataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        persistent_workers=NUM_WORKERS > 0,
-    )
+    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
 
     ms_cfg = model.multiscale_cfg
     preds_rows, cands_rows, tracks_rows = [], [], []
