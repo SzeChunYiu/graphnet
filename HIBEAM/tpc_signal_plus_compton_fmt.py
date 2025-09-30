@@ -191,7 +191,9 @@ def ray_cylinder_entry(p0: np.ndarray, u: np.ndarray, r_layer: float, z_half: fl
 # -------------------------------
 def build_track_pulses(poly: np.ndarray, layer_radii: np.ndarray, z_half: float,
                        step_m: float, beta: float, t0_ns: float,
-                       rng: np.random.Generator) -> List[dict]:
+                       rng: np.random.Generator,signal_bkg:int) -> List[dict]:
+                       #signal_bkg = 0 if bkg; = 1 if signal. 
+
     hits = polyline_layer_crossings(poly, layer_radii, z_half)
     if not hits:
         step = max(1, len(poly)//10)
@@ -202,7 +204,7 @@ def build_track_pulses(poly: np.ndarray, layer_radii: np.ndarray, z_half: float,
     for (_, li, s), (pt, _, _) in zip(hits, hits):
         rows.append({
             "dom_x": float(pt[0]), "dom_y": float(pt[1]), "dom_z": float(pt[2]),
-            "dom_t": float(t0_ns + s/v),
+            "dom_t": float(t0_ns + s/v),"signal_bkg":signal_bkg
         })
     return rows
 
@@ -234,7 +236,7 @@ def build_signal_tracks(n_tracks: int, layer_radii: np.ndarray, rng: np.random.G
             continue
 
         t0 = float(rng.uniform(0.0, 50.0))
-        rows = build_track_pulses(poly, layer_radii, z_half, step_m, beta, t0, rng)
+        rows = build_track_pulses(poly, layer_radii, z_half, step_m, beta, t0, rng,1)
         if rows:
             tracks.append(rows)
             truth_tracks.append({
@@ -264,7 +266,7 @@ def build_compton_tracks(n_tracks: int, surface_mode: str, p_inner: float,
         if len(poly) < 2:
             continue
         t0 = float(rng.uniform(0.0, 50.0))
-        rows = build_track_pulses(poly, layer_radii, z_half, step_m, beta, t0, rng)
+        rows = build_track_pulses(poly, layer_radii, z_half, step_m, beta, t0, rng,0)
         if rows:
             tracks.append(rows)
             truth_tracks.append({
@@ -307,7 +309,7 @@ def generate_dataset(out_dir: Path,
             attempts += 1
 
             # Common event vertex within target cylinder
-            vtx = sample_target_vertex(0.20, -0.04, 0.04, rng)
+            vtx = sample_target_vertex(0.20, -0.004, 0.004, rng)
 
             sig_tracks, sig_truth = build_signal_tracks(n_signal_per_event, layer_radii, rng, r_in, r_out, z_half, step_m, beta, vtx)
             cmp_tracks, cmp_truth = build_compton_tracks(n_compton_per_event, surface_mode, p_inner, layer_radii, rng, r_in, r_out, z_half, step_m, beta)
@@ -356,7 +358,9 @@ def generate_dataset(out_dir: Path,
         t_path  = truth_dir        / f"truth_{fi}.parquet"
         tt_path = truth_tracks_dir / f"truth_tracks_{fi}.parquet"
 
-        pulses_df = pd.DataFrame(pulses_rows)[["event_id","track_id","particle","dom_x","dom_y","dom_z","dom_t"]]
+        pulses_df = pd.DataFrame(pulses_rows)[["event_id","track_id","particle","dom_x","dom_y","dom_z","dom_t","signal_bkg"]]
+        pulses_df["signal_bkg"] = pulses_df["signal_bkg"].astype("int8")
+        
         truth_df  = pd.DataFrame(truth_rows)[["event_id","position_x","position_y","position_z"]]
         truth_tracks_df = pd.DataFrame(truth_tracks_rows)[["event_id","track_id","particle","start_x","start_y","start_z","dir_x","dir_y","dir_z","n_hits"]]
 
@@ -389,7 +393,7 @@ def build_argparser():
 def main():
     args = build_argparser().parse_args()
 
-    out_dir = Path("training_data") / f"compton_{args.n_compton_per_event}" / f"particle_{args.n_signal_per_event}"
+    out_dir = Path("data/training_data") / f"compton_{args.n_compton_per_event}" / f"particle_{args.n_signal_per_event}"
     out_dir.mkdir(parents=True, exist_ok=True)
     generate_dataset(
         out_dir=out_dir,
@@ -402,7 +406,7 @@ def main():
         n_layers=args.n_layers, step_cm=args.step_cm, beta=args.beta, seed=args.seed
     )
 
-    out_dir = Path("validation_data") / f"compton_{args.n_compton_per_event}" / f"particle_{args.n_signal_per_event}"
+    out_dir = Path("data/validation_data") / f"compton_{args.n_compton_per_event}" / f"particle_{args.n_signal_per_event}"
     out_dir.mkdir(parents=True, exist_ok=True)
     generate_dataset(
         out_dir=out_dir,

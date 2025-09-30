@@ -73,7 +73,7 @@ def main():
     ap.add_argument("--signal-min",  type=int, default=2, help="Min signal per event (inclusive)")
     ap.add_argument("--signal-max",  type=int, default=3, help="Max signal per event (inclusive)")
     ap.add_argument("--n-files", type=int, default=20, help="Number of files per job")
-    ap.add_argument("--events-per-file", type=int, default=500, help="Kept events per file")
+    ap.add_argument("--events-per-file", type=int, default=5000, help="Kept events per file")
     ap.add_argument("--surface", choices=["inner","outer","both"], default="both",
                     help="Compton birth surface")
     ap.add_argument("--p-inner", type=float, default=0.5,

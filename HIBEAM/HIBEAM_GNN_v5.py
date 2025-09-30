@@ -34,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 import pytorch_lightning as pl
+from v5_modules.gnn_with_track_cls import VertexGNNWithTrackCls
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
@@ -47,17 +48,28 @@ from graphnet.training.loss_functions import LogCoshLoss
 # ---------------- Detector（請確保你專案有此模組） ----------------
 from hibeam_det import HIBEAM_Detector
 
+
+# --------------------------------------------------
+# Setting files origin and output directories (matched to v4_allinone style)
+
+TRAIN_BASE = Path(f"data/training_data")
+VALID_BASE = Path(f"data/validation_data")
+RESULTS_BASE = Path("results/v5_results")
+TRACKS_BASE = Path("results/v5_results_tracks")
+FIGS_BASE = Path("results/v5_plots")
+# --------------------------------------------------
+
 # ==================================================
 # 執行常數（可直接改這幾個就好）
 # ==================================================
 BATCH_SIZE = 64
-MAX_EPOCHS = 1 #30
+MAX_EPOCHS = 25 #30
 GPUS = [0]         # []=CPU, [0] 用第一張 GPU
 USE_TIME = True    # 使用 dom_t 特徵
 AUTO_VIZ = False   # 訓練+推論之後，是否自動畫圖（XY/ZY）
 N_VIZ_EACH = 20    # 每個 res_tag 隨機可視化的事件數
 
-# ROI 用於 signal 標記（保持 v3） ### can change?!
+# ROI 用於 signal 標記（保持 v3）
 ROI_XY = (0.0, 0.0)
 ROI_Z_MIN, ROI_Z_MAX = -0.04, 0.04
 ROI_R_TRAIN = 0.2  # 20 cm
@@ -71,17 +83,7 @@ MULTISCALE_CFG = [
     {'eps': 0.55, 'min_samples': 4, 'scale_xyz': (0.10, 0.10, 0.10), 't_scale': 1e-2},
     {'eps': 0.80, 'min_samples': 5, 'scale_xyz': (0.20, 0.20, 0.20), 't_scale': 2e-2},
 ]
-
 # ==================================================
-# Setting files origin and output directories
-# ==================================================
-
-# Force your custom dataset folder
-TRAIN_BASE = Path("training_data")     # <--- change here
-VALID_BASE = Path("validation_data")   # <--- change here
-RESULTS_BASE = Path("results/v5_results")
-TRACKS_BASE = Path("results/v5_results_tracks")
-FIGS_BASE   = Path("results/v5_plots")
 
 
 # ==================================================
@@ -477,7 +479,6 @@ class MultiTrackModel(pl.LightningModule):
 
     def training_step(self, batch: Batch, batch_idx: int) -> Tensor:
         vx, vy, vz = batch.position_x, batch.position_y, batch.position_z
-        B = getattr(batch, "num_graphs", vx.shape[0])
         y_true = torch.stack([vx, vy, vz], dim=1)             # [B,3]
         is_signal = self._is_signal(vx, vy, vz)               # [B]
 
@@ -518,18 +519,16 @@ class MultiTrackModel(pl.LightningModule):
 
         loss = loss_pos + loss_sig + 0.5 * loss_qual + 0.5 * loss_ptr + 0.1 * loss_align
 
-        self.log("train/pos",  loss_pos,  prog_bar=True,  batch_size=B)
-        self.log("train/cls",  loss_sig,  prog_bar=True,  batch_size=B)
-        self.log("train/qual", loss_qual, prog_bar=False, batch_size=B)
-        self.log("train/ptr",  loss_ptr,  prog_bar=False, batch_size=B)
-        self.log("train/align",loss_align,prog_bar=False, batch_size=B)
-        self.log("train/loss", loss,      prog_bar=True,  batch_size=B)
-
+        self.log("train/pos", loss_pos, prog_bar=True)
+        self.log("train/cls", loss_sig, prog_bar=True)
+        self.log("train/qual", loss_qual, prog_bar=False)
+        self.log("train/ptr", loss_ptr, prog_bar=False)
+        self.log("train/align", loss_align, prog_bar=False)
+        self.log("train/loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch: Batch, batch_idx: int) -> None:
         vx, vy, vz = batch.position_x, batch.position_y, batch.position_z
-        B = getattr(batch, "num_graphs", vx.shape[0])  # <- add this line
         y_true = torch.stack([vx, vy, vz], dim=1)
         is_signal = self._is_signal(vx, vy, vz)
 
@@ -570,12 +569,12 @@ class MultiTrackModel(pl.LightningModule):
 
             loss = loss_pos + loss_sig + 0.5 * loss_qual + 0.5 * loss_ptr + 0.1 * loss_align
 
-            self.log("val/pos",  loss_pos,  prog_bar=True,  batch_size=B)
-            self.log("val/cls",  loss_sig,  prog_bar=True,  batch_size=B)
-            self.log("val/qual", loss_qual, prog_bar=False, batch_size=B)
-            self.log("val/ptr",  loss_ptr,  prog_bar=False, batch_size=B)
-            self.log("val/align",loss_align,prog_bar=False, batch_size=B)
-            self.log("val/loss", loss,      prog_bar=True,  batch_size=B)
+            self.log("val/pos", loss_pos, prog_bar=True)
+            self.log("val/cls", loss_sig, prog_bar=True)
+            self.log("val/qual", loss_qual, prog_bar=False)
+            self.log("val/ptr", loss_ptr, prog_bar=False)
+            self.log("val/align", loss_align, prog_bar=False)
+            self.log("val/loss", loss, prog_bar=True)
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.get("lr", 1e-3))
@@ -596,7 +595,8 @@ def train_and_eval_for_dir(
     if max_epochs is None:
         max_epochs = MAX_EPOCHS
 
-    out_root = RESULTS_BASE / (folder or "run") / mul_tag / res_tag
+    base = Path(folder) if folder else RESULTS_BASE
+    out_root = base / mul_tag / res_tag
     out_root.mkdir(parents=True, exist_ok=True)
 
     detector = HIBEAM_Detector()
@@ -613,13 +613,13 @@ def train_and_eval_for_dir(
             "truth_table": "truth",
             "features": features,
             "truth": truth,
-            "graph_definition": graph_definition,
+            "data_representation": graph_definition,
             "index_column": "event_id",
         },
         train_dataloader_kwargs={
             "batch_size": BATCH_SIZE,
             "num_workers": 2,
-            "persistent_workers": False,
+            "persistent_workers": True,
             "pin_memory": False,
             "shuffle": True,
         },
@@ -628,8 +628,7 @@ def train_and_eval_for_dir(
     train_loader = dm.train_dataloader
     val_loader = dm.val_dataloader
 
-    model = MultiTrackModel(
-        graph_definition=graph_definition,
+    model = MultiTrackModel(graph_definition=graph_definition,
         lr=1e-3,
         z_target=0.0,
         use_time=use_time,
@@ -657,7 +656,10 @@ def train_and_eval_for_dir(
     # event 級預測
     preds_df = pd.read_parquet(out_root/"event_level_information/"/"predictions.parquet")
     # 真值
-    truth_files = sorted(Path(pred_dir, "truth").glob("truth_*.parquet"))
+    truth_files = sorted(Path(pred_dir, 'truth').glob('truth_*.parquet'))
+    if not truth_files:
+        print(f"[warn] No truth files under {Path(pred_dir) / 'truth'}. Skipping residual histograms.")
+        return out_root
     truth_df = pd.concat((pd.read_parquet(str(f)) for f in truth_files), ignore_index=True)
     merged = preds_df.merge(truth_df, on="event_id", how="inner")
     merged["dx"] = merged["position_x_pred"] - merged["position_x"]
@@ -712,10 +714,20 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
         truth_table="truth",
         features=features,
         truth=truth,
-        graph_definition=graph_definition,
+        data_representation=graph_definition,
         index_column="event_id",
     )
     loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
+
+    # Guard: empty dataset
+    if getattr(dataset, 'n_events', None) in (0, None) and len(dataset) == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        import pandas as pd
+        pd.DataFrame([]).to_parquet(out_dir / 'predictions.parquet', index=False)
+        pd.DataFrame([]).to_parquet(out_dir / 'candidates.parquet', index=False)
+        pd.DataFrame([]).to_parquet(out_dir / 'tracks_hits.parquet', index=False)
+        print(f"[predict] Dataset empty. Wrote empty outputs to → {out_dir}")
+        return
 
     ms_cfg = model.multiscale_cfg
 
@@ -726,6 +738,51 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     model.eval()
     with torch.no_grad():
         for batch in loader:
+            # --- compute node-level signal scores and aggregate to track ---
+            model.eval()
+            with torch.no_grad():
+                try:
+                    logit, w, v_pred_node = model(batch)
+                except Exception:
+                    # If model returns different structure, skip classification aggregation
+                    logit = None
+            if logit is not None:
+                import pandas as pd, torch
+                node_scores = torch.sigmoid(logit).detach().cpu().numpy()
+                # track ids per node
+                if hasattr(batch, "track_id"):
+                    track_id_node = batch.track_id.detach().cpu().numpy().reshape(-1)
+                else:
+                    import numpy as np
+                    track_id_node = -1 * np.ones_like(node_scores, dtype=int)
+                # event ids per node
+                if hasattr(batch, "event_id_graph"):
+                    eid_node = batch.event_id_graph.detach().cpu().numpy()[batch.batch.detach().cpu().numpy()]
+                elif hasattr(batch, "event_id"):
+                    eid = batch.event_id.detach().cpu().numpy()
+                    if eid.shape[0] == node_scores.shape[0]:
+                        eid_node = eid
+                    elif eid.shape[0] == int(batch.num_graphs):
+                        eid_node = eid[batch.batch.detach().cpu().numpy()]
+                    else:
+                        import numpy as np
+                        eid_node = -1 * np.ones_like(node_scores, dtype=int)
+                else:
+                    import numpy as np
+                    eid_node = -1 * np.ones_like(node_scores, dtype=int)
+                # aggregate
+                import pandas as pd
+                df_nodes = pd.DataFrame({
+                    "event_id": eid_node,
+                    "track_id": track_id_node,
+                    "node_signal_score": node_scores,
+                })
+                df_nodes = df_nodes[df_nodes["track_id"] != -1]
+                if len(df_nodes) > 0:
+                    df_tracks = (df_nodes.groupby(["event_id","track_id"])["node_signal_score"]
+                                         .mean().reset_index()
+                                         .rename(columns={"node_signal_score":"track_signal_score"}))
+                    tracks_class_rows.extend(df_tracks.to_dict(orient="records"))
             vertex_pred, signal_logit, aux = model(batch)  # B-size
 
             B = int(batch.num_graphs)
@@ -809,145 +866,15 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     tracks_df = pd.DataFrame(tracks_rows)
     try:
         tracks_df.to_parquet(out_dir / "tracks_hits.parquet", index=False, engine="pyarrow")
+        # save per-track classification scores
+        if len(tracks_class_rows) > 0:
+            import pandas as pd, os
+            pd.DataFrame(tracks_class_rows).to_parquet(os.path.join(out_dir, "tracks_class.parquet"), index=False)
+
     except Exception:
         tracks_df.to_parquet(out_dir / "tracks_hits.parquet", index=False)
 
     print(f"[predict] Saved → {out_dir}")
-
-
-# ========================= V5: modular overrides (no main structure change) =========================
-from v5_modules.clustering import robust_build_scaled_features as _v5_build_scaled_features, cluster_multiscale_union as _v5_ms_union
-from v5_modules.ltb import train_edge_head_supervised_or_pseudo as _v5_train_ltb, run_ltb_tracks as _v5_run_ltb
-
-def _build_scaled_features(xyz, t, cfg, use_time):
-    return _v5_build_scaled_features(xyz, t, cfg, use_time)
-
-def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: Path, use_time: bool, graph_definition: KNNGraph):
-    from graphnet.data.dataset import ParquetDataset
-    from torch_geometric.loader import DataLoader as PyGDataLoader
-    import numpy as np, pandas as pd, torch
-    from sklearn.cluster import DBSCAN
-
-    features = ["dom_x","dom_y","dom_z","dom_t"] if use_time else ["dom_x","dom_y","dom_z"]
-    truth = ["position_x","position_y","position_z"]
-    dataset = ParquetDataset(path=data_dir, pulsemaps=["pulses"], truth_table="truth",
-                             features=features, truth=truth, graph_definition=graph_definition,
-                             index_column="event_id")
-    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
-
-    # train LTB if not ready
-    if not hasattr(model, "edge_head"):
-        try:
-            _v5_train_ltb(model, data_dir, graph_definition, use_time=use_time)
-        except Exception as e:
-            print("[V5] LTB training failed, will fallback:", e)
-
-    preds_rows = []; cands_rows = []; tracks_rows = []
-
-    model.eval()
-    with torch.no_grad():
-        for batch in loader:
-            vertex_pred, signal_logit, aux = model(batch)
-
-            B = int(batch.num_graphs)
-            event_ids = batch.event_id.detach().cpu().numpy().tolist()
-            node_batch = batch.batch.detach().cpu().numpy()
-            x_np = batch.x.detach().cpu().numpy()
-            has_t = use_time and x_np.shape[1] >= 4
-            boundaries = np.where(np.diff(node_batch) != 0)[0] + 1
-            starts = np.concatenate([[0], boundaries]); ends = np.concatenate([boundaries, [len(node_batch)]])
-
-            att = aux.get("att_weights", None)
-            qual_logit = aux.get("qual_logit", None)
-            ptr_logit  = aux.get("ptr_logit", None)
-            cand_mask  = aux.get("cand_mask", None)
-            cand_raw_list = aux.get("cand_raw_list", None)
-            very_neg = torch.finfo(ptr_logit.dtype).min/2 if ptr_logit is not None else -1e9
-
-            for i in range(B):
-                eid = int(event_ids[i])
-                vp = vertex_pred[i].detach().cpu().numpy()
-                preds_rows.append({
-                    "event_id": eid,
-                    "position_x_pred": float(vp[0]),
-                    "position_y_pred": float(vp[1]),
-                    "position_z_pred": float(vp[2]),
-                    "signal_score": float(torch.sigmoid(signal_logit[i]).item()),
-                })
-
-                if cand_mask is not None and att is not None and qual_logit is not None and ptr_logit is not None and cand_raw_list is not None:
-                    valid = int(cand_mask[i].sum().item())
-                    att_i = att[i, :valid].detach().cpu().numpy() if valid>0 else np.zeros((0,))
-                    qual_i = torch.sigmoid(qual_logit[i, :valid]).detach().cpu().numpy() if valid>0 else np.zeros((0,))
-                    ptr_logits_masked = ptr_logit[i].masked_fill(~cand_mask[i], very_neg)
-                    ptr_i = int(torch.argmax(ptr_logits_masked).item()) if valid>0 else 0
-                    raw = cand_raw_list[i].numpy() if cand_raw_list[i].numel()>0 else np.zeros((0,5), dtype=np.float32)
-                    for j in range(min(valid, raw.shape[0])):
-                        vx,vy,vz,nh,sid = raw[j]
-                        cands_rows.append({
-                            "event_id": eid, "cand_idx": j,
-                            "vx": float(vx), "vy": float(vy), "vz": float(vz),
-                            "n_hits": float(nh), "scale_id": int(sid),
-                            "att_weight": float(att_i[j]) if j < len(att_i) else float('nan'),
-                            "qual_score": float(qual_i[j]) if j < len(qual_i) else float('nan'),
-                            "is_pointer": int(j == ptr_i),
-                        })
-
-                s,e = starts[i], ends[i]
-                xyz = x_np[s:e, :3]
-                tvec = x_np[s:e, 3] if has_t else None
-
-                clusters = _v5_run_ltb(model, xyz, tvec, use_time=has_t)
-
-                if len(clusters) == 0:
-                    ms_cfg = model.multiscale_cfg if hasattr(model,'multiscale_cfg') else [{'eps':0.5,'min_samples':3,'scale_xyz':(0.1,0.1,0.1)}]
-                    clusters = _v5_ms_union(xyz, tvec, ms_cfg, use_time=has_t)
-                    if len(clusters) == 0 and len(xyz) >= 2:
-                        cfg0 = ms_cfg[0]
-                        Z0 = _v5_build_scaled_features(xyz, tvec, cfg0, use_time=has_t)
-                        labels0 = DBSCAN(eps=max(2.5, float(cfg0.get("eps", 0.5)) * 3), min_samples=2).fit_predict(Z0)
-                        for tid in np.unique(labels0):
-                            if tid < 0: continue
-                            idxs = np.where(labels0 == tid)[0]
-                            if len(idxs) >= 2:
-                                clusters.append({"scale_id": 0, "idxs": idxs})
-
-                assigned = np.zeros(len(xyz), dtype=bool)
-                local_tid = 0
-                for c in clusters:
-                    idxs = c["idxs"]
-                    assigned[idxs] = True
-                    xs = xyz[idxs, 0].astype(float).tolist()
-                    ys = xyz[idxs, 1].astype(float).tolist()
-                    zs = xyz[idxs, 2].astype(float).tolist()
-                    ts = (tvec[idxs].astype(float).tolist() if has_t and tvec is not None else [float("nan")] * len(xs))
-                    tracks_rows.append({
-                        "event_id": eid, "scale_id": int(c["scale_id"]), "track_id": int(local_tid),
-                        "x": xs, "y": ys, "z": zs, "t": ts,
-                    })
-                    local_tid += 1
-
-                left = np.where(~assigned)[0]
-                if len(left) > 0:
-                    xs = xyz[left, 0].astype(float).tolist()
-                    ys = xyz[left, 1].astype(float).tolist()
-                    zs = xyz[left, 2].astype(float).tolist()
-                    ts = (tvec[left].astype(float).tolist() if has_t and tvec is not None else [float("nan")] * len(xs))
-                    tracks_rows.append({"event_id": eid, "scale_id": -1, "track_id": -1, "x": xs, "y": ys, "z": zs, "t": ts})
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    import pandas as pd
-    pd.DataFrame(preds_rows).to_parquet(out_dir / "predictions.parquet", index=False)
-    pd.DataFrame(cands_rows).to_parquet(out_dir / "candidates.parquet", index=False)
-    df_tracks = pd.DataFrame(tracks_rows)
-    try:
-        df_tracks.to_parquet(out_dir / "tracks_hits.parquet", index=False, engine="pyarrow")
-    except Exception:
-        df_tracks.to_parquet(out_dir / "tracks_hits.parquet", index=False)
-    print(f"[predict] Saved → {out_dir}")
-# ========================= END V5 modular overrides =========================
-
-
 
 # ========================= PATCH: Robust clustering =========================
 # 多尺度聯合集群 + 自適應 eps + 小樣本友好 + robust 時間處理
@@ -1176,13 +1103,14 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
         truth_table="truth",
         features=features,
         truth=truth,
-        graph_definition=graph_definition,
+        data_representation=graph_definition,
         index_column="event_id",
     )
     loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
 
     ms_cfg = model.multiscale_cfg
     preds_rows, cands_rows, tracks_rows = [], [], []
+    tracks_class_rows = []  # new: per-track signal scores
 
     model.eval()
     with torch.no_grad():
@@ -1360,17 +1288,10 @@ def visualize_all(results_base: Path, n_each: int = 20, out_root: Path = FIGS_BA
 # ==================================================
 # main（無參數，自動掃描與執行）
 # ==================================================
-def main() -> None:
-    if not TRAIN_BASE.exists():
-        print(f"[main] training_data not found: {TRAIN_BASE.resolve()}")
-        return
-    if not VALID_BASE.exists():
-        print(f"[main] validation_data not found: {VALID_BASE.resolve()}")
-        return
 
+def main():
     pl.seed_everything(42, workers=True)
 
-    # loop over all compton/particle combinations
     all_combos = sorted(TRAIN_BASE.glob("compton_*/*"))
     if not all_combos:
         print(f"[main] no combos under {TRAIN_BASE}/compton_*/particle_*")
@@ -1382,13 +1303,10 @@ def main() -> None:
 
         mul_tag = combo.parent.name   # e.g. "compton_0"
         res_tag = combo.name          # e.g. "particle_3"
-
         data_dir = str(combo)
-        # match the same relative path in validation_data
         pred_dir = str((VALID_BASE / combo.relative_to(TRAIN_BASE)).resolve())
 
-        print(f"\n=== Training for {mul_tag}/{res_tag} ==="
-              f"\nData: {data_dir}\nValidation: {pred_dir}")
+        print(f"=== Training for {mul_tag}/{res_tag} ==="f"Data: {data_dir}Validation: {pred_dir}")
 
         out_dir = train_and_eval_for_dir(
             data_dir=data_dir,
@@ -1396,11 +1314,16 @@ def main() -> None:
             res_tag=res_tag,
             mul_tag=mul_tag,
             max_epochs=MAX_EPOCHS,
-            folder=RESULTS_BASE,
-            use_time=USE_TIME,   # << force False into v5
+            folder=str(RESULTS_BASE),
+            use_time=USE_TIME,
         )
-        print(f"Saved outputs to {out_dir}")
+        
+        print(f"[main] Saved outputs to: {out_dir}")
 
 if __name__ == "__main__":
+    try:
+        import torch.multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
     main()
-
