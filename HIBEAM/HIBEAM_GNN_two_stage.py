@@ -18,7 +18,7 @@ If no sub-combos are found, the script treats the given directory as a single da
 import os
 import json
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 import numpy as np
@@ -79,6 +79,8 @@ def build_argparser():
                    help="File name for exported p (placed under each combo's stage1 dir)")
     p.add_argument("--merged-val-subdir", type=str, default="val_with_p",
                    help="Subdir (under each combo output) to hold a VAL copy with p merged")
+    p.add_argument("--merged-train-subdir", type=str, default="train_with_p",
+                   help="Subdir (under each combo output) to hold a TRAIN copy with p merged")
 
     return p
 
@@ -154,13 +156,13 @@ def collect_node_rows(batch, probs: np.ndarray) -> List[Tuple[int,int,float]]:
     rows = [(int(event_ids[gidx[i]]), int(pulse_ids_np[i]), float(probs[i])) for i in range(len(probs))]
     return rows
 
-def merge_node_probs_into_pulsemaps(val_dir: str, out_dir_with_p: str, pulsemaps_name: str, index_column: str, probs_parquet: str):
+def merge_node_probs_into_pulsemaps(source_dir: str, out_dir_with_p: str, pulsemaps_name: str, index_column: str, probs_parquet: str):
     out = Path(out_dir_with_p)
     out.mkdir(parents=True, exist_ok=True)
-    val_path = Path(val_dir)
+    source_path = Path(source_dir)
 
     # Copy everything except pulsemaps
-    for item in val_path.iterdir():
+    for item in source_path.iterdir():
         if item.name == f"{pulsemaps_name}.parquet":
             continue
         target = out / item.name
@@ -170,7 +172,7 @@ def merge_node_probs_into_pulsemaps(val_dir: str, out_dir_with_p: str, pulsemaps
         else:
             target.write_bytes(item.read_bytes())
 
-    pm_path = val_path / f"{pulsemaps_name}.parquet"
+    pm_path = source_path / f"{pulsemaps_name}.parquet"
     if not pm_path.exists():
         raise FileNotFoundError(f"Pulsemaps parquet not found: {pm_path}")
 
@@ -267,10 +269,27 @@ def move_to_device(batch, device: str):
 # ----------------------------
 # Training
 # ----------------------------
+def export_node_probabilities(model: nn.Module, loader, device: str, out_path: Path) -> str:
+    rows = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_to_device(batch, device)
+            logits = model(batch)
+            p = torch.sigmoid(logits).detach().cpu().numpy()
+            rows.extend(collect_node_rows(batch, p))
+
+    p_df = pd.DataFrame(rows, columns=["event_id", "pulse_id", "p"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    p_df.to_parquet(out_path, index=False)
+    print(f"[Stage-1] wrote node probabilities → {out_path}")
+    return str(out_path)
+
+
 def train_stage1(train_dir: str, val_dir: str, out_dir: str, features_stage1: List[str],
                  pulsemaps_name: str, truth_table: str, index_column: str,
                  knn_k: int, device: str, batch_size: int, epochs: int, lr: float,
-                 prob_parquet_name: str) -> str:
+                 prob_parquet_name: str,
+                 export_splits: Sequence[str] = ("val", "train")) -> Dict[str, str]:
     detector = ensure_detector()
     graph_def = build_graph_definition(detector, knn_k)
 
@@ -280,8 +299,10 @@ def train_stage1(train_dir: str, val_dir: str, out_dir: str, features_stage1: Li
                             graph_def, index_column, pulsemaps_name, truth_table)
 
     from torch_geometric.loader import DataLoader as PyGDataLoader
-    train_loader = PyGDataLoader(ds_train, batch_size=batch_size, shuffle=True,  num_workers=2, persistent_workers=True, pin_memory=False)
-    val_loader   = PyGDataLoader(ds_val,   batch_size=batch_size, shuffle=False, num_workers=2, persistent_workers=True, pin_memory=False)
+    common_loader_kwargs = dict(batch_size=batch_size, num_workers=2, persistent_workers=True, pin_memory=False)
+    train_loader = PyGDataLoader(ds_train, shuffle=True, **common_loader_kwargs)
+    val_loader   = PyGDataLoader(ds_val,   shuffle=False, **common_loader_kwargs)
+    train_eval_loader = PyGDataLoader(ds_train, shuffle=False, **common_loader_kwargs)
 
     nb_inputs = get_nb_inputs_from_dataset(ds_train)
     model = NodeClassifier(nb_inputs=nb_inputs).to(device)
@@ -320,23 +341,20 @@ def train_stage1(train_dir: str, val_dir: str, out_dir: str, features_stage1: Li
             torch.save(model.state_dict(), ckpt_path)
 
     # Export p for VAL
-    print(f"[Stage-1] exporting per-node probabilities for VAL: {val_dir}")
+    print(f"[Stage-1] exporting per-node probabilities")
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
 
-    rows = []
-    with torch.no_grad():
-        for batch in val_loader:
-            batch = move_to_device(batch, device)
-            logits = model(batch)
-            p = torch.sigmoid(logits).detach().cpu().numpy()
-            rows.extend(collect_node_rows(batch, p))
+    requested = set(export_splits)
+    results: Dict[str, str] = {}
+    if "val" in requested:
+        out_parquet = Path(out_dir) / prob_parquet_name
+        results["val"] = export_node_probabilities(model, val_loader, device, out_parquet)
+    if "train" in requested:
+        out_parquet_train = Path(out_dir) / f"train_{prob_parquet_name}"
+        results["train"] = export_node_probabilities(model, train_eval_loader, device, out_parquet_train)
 
-    p_df = pd.DataFrame(rows, columns=["event_id","pulse_id","p"])
-    out_parquet = Path(out_dir) / prob_parquet_name
-    p_df.to_parquet(out_parquet, index=False)
-    print(f"[Stage-1] wrote {out_parquet}")
-    return str(out_parquet)
+    return results
 
 def train_stage2(train_dir: str, val_dir: str, out_dir: str, features_stage2: List[str], truth_cols: List[str],
                  pulsemaps_name: str, truth_table: str, index_column: str,
@@ -392,16 +410,18 @@ def list_combos(root: Path) -> List[Path]:
     combos = sorted(root.glob("compton_*/*"))
     return [c for c in combos if c.is_dir()]
 
-def run_stage1_for_combo(args, rel_path: Path):
+def run_stage1_for_combo(args, rel_path: Path, export_splits: Optional[Sequence[str]] = None):
     train_combo = Path(args.train_dir) / rel_path
     val_combo   = Path(args.val_dir) / rel_path
     out_combo   = Path(args.out_dir) / rel_path / "stage1"
     out_combo.mkdir(parents=True, exist_ok=True)
-    probs_path = train_stage1(
+    features_stage1 = json.loads(args.feature_cols_s1)
+    splits = export_splits if export_splits is not None else ("val", "train")
+    prob_paths = train_stage1(
         train_dir=str(train_combo),
         val_dir=str(val_combo),
         out_dir=str(out_combo),
-        features_stage1=json.loads(args.feature_cols_s1),
+        features_stage1=features_stage1,
         pulsemaps_name=args.pulsemaps_name,
         truth_table=args.truth_table,
         index_column=args.index_column,
@@ -411,13 +431,15 @@ def run_stage1_for_combo(args, rel_path: Path):
         epochs=args.epochs1,
         lr=args.lr1,
         prob_parquet_name=args.prob_parquet_name,
+        export_splits=splits,
     )
-    print(f"[done] Stage-1 {rel_path} → {probs_path}")
-    return probs_path
+    rendered = ", ".join(f"{split}={path}" for split, path in prob_paths.items())
+    print(f"[done] Stage-1 {rel_path} → {rendered}")
+    return prob_paths
 
-def run_stage2_for_combo(args, rel_path: Path, val_with_p_dir: Optional[str] = None):
-    train_combo = Path(args.train_dir) / rel_path
-    val_combo   = Path(args.val_dir) / rel_path if val_with_p_dir is None else Path(val_with_p_dir)
+def run_stage2_for_combo(args, rel_path: Path, train_with_p_dir: Optional[str] = None, val_with_p_dir: Optional[str] = None):
+    train_combo = Path(train_with_p_dir) if train_with_p_dir is not None else Path(args.train_dir) / rel_path
+    val_combo   = Path(val_with_p_dir) if val_with_p_dir is not None else Path(args.val_dir) / rel_path
     out_combo   = Path(args.out_dir) / rel_path / "stage2"
     out_combo.mkdir(parents=True, exist_ok=True)
     train_stage2(
@@ -472,18 +494,35 @@ def main():
             for combo in combos:
                 rel = combo.relative_to(train_root)
                 print(f"\n=== Combo: {rel} ===")
-                probs_path = run_stage1_for_combo(args, rel)
-                # merge p into this combo's VAL pulsemaps
-                merged_dir = Path(args.out_dir) / rel / args.merged_val_subdir
+                prob_paths = run_stage1_for_combo(args, rel)
+                val_probs = prob_paths.get("val")
+                train_probs = prob_paths.get("train")
+                if val_probs is None:
+                    raise RuntimeError("Stage-1 did not produce validation probabilities; cannot continue two-stage pipeline.")
+                if train_probs is None:
+                    raise RuntimeError("Stage-1 did not produce training probabilities; cannot continue two-stage pipeline.")
+
                 merged_val_dir = merge_node_probs_into_pulsemaps(
-                    val_dir=str(val_root / rel),
-                    out_dir_with_p=str(merged_dir),
+                    source_dir=str(val_root / rel),
+                    out_dir_with_p=str(Path(args.out_dir) / rel / args.merged_val_subdir),
                     pulsemaps_name=args.pulsemaps_name,
                     index_column=args.index_column,
-                    probs_parquet=probs_path,
+                    probs_parquet=val_probs,
                 )
-                # Stage-2 for this combo (using merged VAL)
-                run_stage2_for_combo(args, rel, val_with_p_dir=merged_val_dir)
+                merged_train_dir = merge_node_probs_into_pulsemaps(
+                    source_dir=str(train_root / rel),
+                    out_dir_with_p=str(Path(args.out_dir) / rel / args.merged_train_subdir),
+                    pulsemaps_name=args.pulsemaps_name,
+                    index_column=args.index_column,
+                    probs_parquet=train_probs,
+                )
+                # Stage-2 for this combo (using merged TRAIN + VAL)
+                run_stage2_for_combo(
+                    args,
+                    rel,
+                    train_with_p_dir=merged_train_dir,
+                    val_with_p_dir=merged_val_dir,
+                )
         return
 
     # Fallback: single dataset mode (no combos under train_dir)
@@ -493,16 +532,32 @@ def main():
         run_stage2_for_combo(args, Path("."))
     elif args.run_two_stage:
         print(f"\n=== Single dataset mode ===")
-        probs_path = run_stage1_for_combo(args, Path("."))
-        merged_dir = Path(args.out_dir) / args.merged_val_subdir
+        prob_paths = run_stage1_for_combo(args, Path("."))
+        val_probs = prob_paths.get("val")
+        train_probs = prob_paths.get("train")
+        if val_probs is None or train_probs is None:
+            raise RuntimeError("Stage-1 did not produce both train and val probabilities in single dataset mode.")
+
         merged_val_dir = merge_node_probs_into_pulsemaps(
-            val_dir=args.val_dir,
-            out_dir_with_p=str(merged_dir),
+            source_dir=args.val_dir,
+            out_dir_with_p=str(Path(args.out_dir) / args.merged_val_subdir),
             pulsemaps_name=args.pulsemaps_name,
             index_column=args.index_column,
-            probs_parquet=probs_path,
+            probs_parquet=val_probs,
         )
-        run_stage2_for_combo(args, Path("."), val_with_p_dir=merged_val_dir)
+        merged_train_dir = merge_node_probs_into_pulsemaps(
+            source_dir=args.train_dir,
+            out_dir_with_p=str(Path(args.out_dir) / args.merged_train_subdir),
+            pulsemaps_name=args.pulsemaps_name,
+            index_column=args.index_column,
+            probs_parquet=train_probs,
+        )
+        run_stage2_for_combo(
+            args,
+            Path("."),
+            train_with_p_dir=merged_train_dir,
+            val_with_p_dir=merged_val_dir,
+        )
 
 if __name__ == "__main__":
     try:
