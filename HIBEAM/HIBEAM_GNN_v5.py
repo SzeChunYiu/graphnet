@@ -37,6 +37,7 @@ import pytorch_lightning as pl
 from v5_modules.gnn_with_track_cls import VertexGNNWithTrackCls
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch_geometric.utils import scatter
 
 # ---------------- GraphNeT（與 v3 相同風格） ----------------
 from graphnet.data import GraphNeTDataModule
@@ -65,7 +66,75 @@ FIGS_BASE = Path("results/v5_plots")
 BATCH_SIZE = 64
 MAX_EPOCHS = 25 #30
 GPUS = [0]         # []=CPU, [0] 用第一張 GPU
-USE_TIME = True    # 使用 dom_t 特徵
+PIPELINE_CONFIG = {
+    "mode": "train",          # 或 "export"
+    "use_time": True,          # 使用 dom_t 特徵
+    "pulses_with_labels_path": None,
+    "thresholds": {
+        "quality": 0.10,
+    },
+}
+
+def feature_names(use_time: bool, include_signal_bkg: bool) -> list[str]:
+    feats = ["dom_x", "dom_y", "dom_z"]
+    if use_time:
+        feats.append("dom_t")
+    if include_signal_bkg:
+        feats.append("signal_bkg")
+    return feats
+
+
+def resolve_pipeline_mode(config: dict[str, Any] | None) -> str:
+    """Normalize the requested pipeline mode into one of train/val/export."""
+
+    mode_raw = "train" if config is None else config.get("mode", "train")
+    mode = str(mode_raw).strip().lower()
+
+    if mode in {"train", "training"}:
+        return "train"
+    if mode in {"val", "valid", "validation"}:
+        return "val"
+    if mode in {"test", "export", "predict", "inference"}:
+        return "export"
+
+    raise ValueError(f"Unsupported pipeline mode: {mode_raw!r}")
+
+
+def _validate_feature_width(loader, expected_dim: int, name: str) -> None:
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        return
+    actual = int(batch.x.shape[1])
+    if actual != expected_dim:
+        raise RuntimeError(
+            f"[{name}] Feature dimension mismatch: loader produced {actual} features, expected {expected_dim}."
+        )
+
+
+def _load_signal_lookup(path: str | Path | None) -> dict[int, np.ndarray]:
+    if path in (None, ""):
+        return {}
+    resolved = Path(path)
+    if not resolved.exists():
+        print(f"[predict] pulses_with_labels_path not found: {resolved}")
+        return {}
+    try:
+        df = pd.read_parquet(resolved)
+    except Exception as exc:
+        print(f"[predict] Failed to read labels parquet {resolved}: {exc}")
+        return {}
+    if "signal_bkg" not in df.columns or "event_id" not in df.columns:
+        print(f"[predict] File {resolved} missing required columns event_id/signal_bkg")
+        return {}
+    if "row_idx" not in df.columns:
+        df = df.copy()
+        df["row_idx"] = df.groupby("event_id").cumcount()
+    df = df.sort_values(["event_id", "row_idx"])
+    lookup: dict[int, np.ndarray] = {}
+    for eid, group in df.groupby("event_id"):
+        lookup[int(eid)] = group["signal_bkg"].to_numpy()
+    return lookup
 AUTO_VIZ = False   # 訓練+推論之後，是否自動畫圖（XY/ZY）
 N_VIZ_EACH = 20    # 每個 res_tag 隨機可視化的事件數
 
@@ -314,12 +383,19 @@ class MultiTrackModel(pl.LightningModule):
         max_candidates: int = 64,
         quality_thresh: float = 0.10,
         x_over_X0: float = 0.01 / 0.0889,  # 厚 1cm、鋁 X0≈8.89cm
+        feature_list: list[str] | None = None,
     ):
         super().__init__()
         try:
             self.save_hyperparameters({"lr": lr})
         except Exception:
             pass
+
+        self.feature_list = list(feature_list) if feature_list else feature_names(use_time, include_signal_bkg=False)
+        self.signal_feature_index = None
+        if feature_list and "signal_bkg" in feature_list:
+            self.signal_feature_index = feature_list.index("signal_bkg")
+        self.coord_dims = 4 if use_time else 3
 
         # Backbone（與 v3 一致：DynEdge + 多種全域池化）
         self.backbone = DynEdge(
@@ -373,11 +449,27 @@ class MultiTrackModel(pl.LightningModule):
         r = torch.sqrt(dx * dx + dy * dy)
         return ((r < ROI_R_TRAIN) & (vz.abs().le(max(abs(ROI_Z_MIN), abs(ROI_Z_MAX))))).float()
 
+    def _get_event_signal_labels(self, batch: Batch) -> Tensor | None:
+        if self.signal_feature_index is None:
+            return None
+        if self.signal_feature_index >= batch.x.shape[1]:
+            return None
+        node_signal = batch.x[:, self.signal_feature_index].detach()
+        event_signal = scatter(
+            node_signal,
+            batch.batch,
+            dim=0,
+            dim_size=int(batch.num_graphs),
+            reduce="max",
+        )
+        return event_signal.float()
+
     def _extract_per_event(self, event_x: Tensor) -> tuple[Tensor, Tensor, torch.Tensor]:
         """對單一事件的 node 特徵產生候選：返回 cand_emb, mask, cand_raw(cpu)."""
         device = event_x.device
-        has_time = self.use_time and (event_x.shape[1] >= 4)
-        pts = event_x[:, :4].detach().cpu().numpy() if has_time else event_x[:, :3].detach().cpu().numpy()
+        has_time = self.use_time and (event_x.shape[1] >= self.coord_dims)
+        coord_cols = self.coord_dims
+        pts = event_x[:, :coord_cols].detach().cpu().numpy()
 
         cands_raw, extra = _extract_candidates_multiscale_v4(
             points=pts,
@@ -480,11 +572,18 @@ class MultiTrackModel(pl.LightningModule):
     def training_step(self, batch: Batch, batch_idx: int) -> Tensor:
         vx, vy, vz = batch.position_x, batch.position_y, batch.position_z
         y_true = torch.stack([vx, vy, vz], dim=1)             # [B,3]
-        is_signal = self._is_signal(vx, vy, vz)               # [B]
 
         vertex_pred, signal_logit, aux = self.forward(batch)
         loss_pos = self.pos_loss(vertex_pred, y_true)
-        loss_sig = self.cls_loss(signal_logit, is_signal)
+
+        signal_targets = self._get_event_signal_labels(batch)
+        if signal_targets is None:
+            if not hasattr(self, "_missing_signal_warned"):
+                print("[train] signal_bkg labels missing; skipping classification loss.")
+                self._missing_signal_warned = True
+            loss_sig = torch.tensor(0.0, device=vertex_pred.device)
+        else:
+            loss_sig = self.cls_loss(signal_logit, signal_targets)
 
         qual_logit = aux["qual_logit"]
         ptr_logit = aux["ptr_logit"]
@@ -530,12 +629,15 @@ class MultiTrackModel(pl.LightningModule):
     def validation_step(self, batch: Batch, batch_idx: int) -> None:
         vx, vy, vz = batch.position_x, batch.position_y, batch.position_z
         y_true = torch.stack([vx, vy, vz], dim=1)
-        is_signal = self._is_signal(vx, vy, vz)
 
         with torch.no_grad():
             vertex_pred, signal_logit, aux = self.forward(batch)
             loss_pos = self.pos_loss(vertex_pred, y_true)
-            loss_sig = self.cls_loss(signal_logit, is_signal)
+            signal_targets = self._get_event_signal_labels(batch)
+            if signal_targets is None:
+                loss_sig = torch.tensor(0.0, device=vertex_pred.device)
+            else:
+                loss_sig = self.cls_loss(signal_logit, signal_targets)
 
             qual_logit = aux["qual_logit"]
             ptr_logit = aux["ptr_logit"]
@@ -591,18 +693,29 @@ def train_and_eval_for_dir(
     max_epochs: int | None = None,
     folder: str | None = None,
     use_time: bool = True,
+    config: dict[str, Any] | None = None,
 ) -> Path:
     if max_epochs is None:
         max_epochs = MAX_EPOCHS
+
+    config = config or PIPELINE_CONFIG
+    mode = resolve_pipeline_mode(config)
+    use_time = bool(config.get("use_time", use_time))
+    include_signal = mode in {"train", "val"}
+    if mode == "export":
+        raise RuntimeError("train_and_eval_for_dir cannot run in export mode; use inference_and_export_tracks instead.")
+    quality_thresh_cfg = float(config.get("thresholds", {}).get("quality", 0.10))
 
     base = Path(folder) if folder else RESULTS_BASE
     out_root = base / mul_tag / res_tag
     out_root.mkdir(parents=True, exist_ok=True)
 
     detector = HIBEAM_Detector()
-    graph_definition = KNNGraph(detector=detector)
-
-    features = ["dom_x", "dom_y", "dom_z", "dom_t"] if use_time else ["dom_x", "dom_y", "dom_z"]
+    features = feature_names(use_time=use_time, include_signal_bkg=include_signal)
+    graph_definition = KNNGraph(
+        detector=detector,
+        input_feature_names=features,
+    )
     truth = ["position_x", "position_y", "position_z"]
 
     dm = GraphNeTDataModule(
@@ -625,8 +738,13 @@ def train_and_eval_for_dir(
         },
     )
 
+    dm.setup(stage="fit")
     train_loader = dm.train_dataloader
     val_loader = dm.val_dataloader
+
+    _validate_feature_width(train_loader, len(features), "train")
+    if val_loader is not None:
+        _validate_feature_width(val_loader, len(features), "val")
 
     model = MultiTrackModel(graph_definition=graph_definition,
         lr=1e-3,
@@ -634,8 +752,9 @@ def train_and_eval_for_dir(
         use_time=use_time,
         multiscale_cfg=MULTISCALE_CFG,
         max_candidates=64,
-        quality_thresh=0.10,
+        quality_thresh=quality_thresh_cfg,
         x_over_X0=0.01/0.0889,
+        feature_list=features,
     )
 
     trainer = pl.Trainer(
@@ -649,7 +768,17 @@ def train_and_eval_for_dir(
     trainer.fit(model, train_loader, val_loader)
 
     # --------- Prediction（event/candidate/track 三表） ---------
-    inference_and_export_tracks(model, pred_dir, out_dir=out_root/"event_level_information/", use_time=use_time, graph_definition=graph_definition)
+    inference_features = feature_names(use_time=use_time, include_signal_bkg=False)
+
+    inference_and_export_tracks(
+        model,
+        pred_dir,
+        out_dir=out_root/"event_level_information/",
+        use_time=use_time,
+        detector=detector,
+        feature_list=inference_features,
+        pulses_with_labels_path=config.get("pulses_with_labels_path"),
+    )
 
     # 為了對齊 v3，我們另外生成一份 predictions.csv 與簡單 histogram
     from matplotlib import pyplot as plt
@@ -704,9 +833,22 @@ def _build_scaled_features(xyz: np.ndarray, t: np.ndarray | None, cfg: dict, use
     return Z
 
 
-def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: Path, use_time: bool, graph_definition: KNNGraph):
-    features = ["dom_x","dom_y","dom_z","dom_t"] if use_time else ["dom_x","dom_y","dom_z"]
-    truth = ["position_x","position_y","position_z"]  # 只為 event_id
+def _inference_and_export_tracks_impl(
+    model: MultiTrackModel,
+    data_dir: str,
+    out_dir: Path,
+    use_time: bool,
+    detector: HIBEAM_Detector,
+    feature_list: list[str],
+    pulses_with_labels_path: str | None = None,
+):
+    features = list(feature_list)
+    truth = ["position_x", "position_y", "position_z"]
+
+    graph_definition = KNNGraph(
+        detector=detector,
+        input_feature_names=features,
+    )
 
     dataset = ParquetDataset(
         path=data_dir,
@@ -719,13 +861,11 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     )
     loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
 
-    # Guard: empty dataset
-    if getattr(dataset, 'n_events', None) in (0, None) and len(dataset) == 0:
+    if getattr(dataset, "n_events", None) in (0, None) and len(dataset) == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
-        import pandas as pd
-        pd.DataFrame([]).to_parquet(out_dir / 'predictions.parquet', index=False)
-        pd.DataFrame([]).to_parquet(out_dir / 'candidates.parquet', index=False)
-        pd.DataFrame([]).to_parquet(out_dir / 'tracks_hits.parquet', index=False)
+        pd.DataFrame([]).to_parquet(out_dir / "predictions.parquet", index=False)
+        pd.DataFrame([]).to_parquet(out_dir / "candidates.parquet", index=False)
+        pd.DataFrame([]).to_parquet(out_dir / "tracks_hits.parquet", index=False)
         print(f"[predict] Dataset empty. Wrote empty outputs to → {out_dir}")
         return
 
@@ -734,115 +874,95 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     preds_rows: List[Dict[str, Any]] = []
     cands_rows: List[Dict[str, Any]] = []
     tracks_rows: List[Dict[str, Any]] = []
+    tracks_class_rows: List[Dict[str, Any]] = []
+    label_lookup = _load_signal_lookup(pulses_with_labels_path)
+    warned_events: set[int] = set()
+    track_truth_map: dict[tuple[int, int], float] = {}
 
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            # --- compute node-level signal scores and aggregate to track ---
-            model.eval()
-            with torch.no_grad():
-                try:
-                    logit, w, v_pred_node = model(batch)
-                except Exception:
-                    # If model returns different structure, skip classification aggregation
-                    logit = None
-            if logit is not None:
-                import pandas as pd, torch
-                node_scores = torch.sigmoid(logit).detach().cpu().numpy()
-                # track ids per node
-                if hasattr(batch, "track_id"):
-                    track_id_node = batch.track_id.detach().cpu().numpy().reshape(-1)
-                else:
-                    import numpy as np
-                    track_id_node = -1 * np.ones_like(node_scores, dtype=int)
-                # event ids per node
-                if hasattr(batch, "event_id_graph"):
-                    eid_node = batch.event_id_graph.detach().cpu().numpy()[batch.batch.detach().cpu().numpy()]
-                elif hasattr(batch, "event_id"):
-                    eid = batch.event_id.detach().cpu().numpy()
-                    if eid.shape[0] == node_scores.shape[0]:
-                        eid_node = eid
-                    elif eid.shape[0] == int(batch.num_graphs):
-                        eid_node = eid[batch.batch.detach().cpu().numpy()]
-                    else:
-                        import numpy as np
-                        eid_node = -1 * np.ones_like(node_scores, dtype=int)
-                else:
-                    import numpy as np
-                    eid_node = -1 * np.ones_like(node_scores, dtype=int)
-                # aggregate
-                import pandas as pd
-                df_nodes = pd.DataFrame({
-                    "event_id": eid_node,
-                    "track_id": track_id_node,
-                    "node_signal_score": node_scores,
-                })
-                df_nodes = df_nodes[df_nodes["track_id"] != -1]
-                if len(df_nodes) > 0:
-                    df_tracks = (df_nodes.groupby(["event_id","track_id"])["node_signal_score"]
-                                         .mean().reset_index()
-                                         .rename(columns={"node_signal_score":"track_signal_score"}))
-                    tracks_class_rows.extend(df_tracks.to_dict(orient="records"))
-            vertex_pred, signal_logit, aux = model(batch)  # B-size
+            vertex_pred, signal_logit, aux = model(batch)
 
             B = int(batch.num_graphs)
             event_ids = batch.event_id.detach().cpu().numpy().tolist()
-
             node_batch = batch.batch.detach().cpu().numpy()
             x_np = batch.x.detach().cpu().numpy()
             has_t = use_time and x_np.shape[1] >= 4
+
+            signal_idx = getattr(model, "signal_feature_index", None)
+            if signal_idx is not None and signal_idx < batch.x.shape[1]:
+                node_truth_all = batch.x[:, signal_idx].detach().cpu().numpy()
+            else:
+                node_truth_all = None
 
             boundaries = np.where(np.diff(node_batch) != 0)[0] + 1
             starts = np.concatenate([[0], boundaries])
             ends = np.concatenate([boundaries, [len(node_batch)]])
 
-            att = aux["att_weights"]                # (B, Cmax)
-            qual_logit = aux["qual_logit"]          # (B, Cmax)
-            ptr_logit  = aux["ptr_logit"]           # (B, Cmax)
-            cand_mask  = aux["cand_mask"]           # (B, Cmax)
-            cand_raw_list = aux["cand_raw_list"]    # list of [Ci,5] CPU tensors
+            att = aux["att_weights"]
+            qual_logit = aux["qual_logit"]
+            ptr_logit = aux["ptr_logit"]
+            cand_mask = aux["cand_mask"]
+            cand_raw_list = aux["cand_raw_list"]
 
-            very_neg = torch.finfo(ptr_logit.dtype).min/2
+            very_neg = torch.finfo(ptr_logit.dtype).min / 2
 
             for i in range(B):
                 eid = int(event_ids[i])
                 vp = vertex_pred[i].detach().cpu().numpy()
-                ss = float(torch.sigmoid(signal_logit[i]).item())
                 preds_rows.append({
                     "event_id": eid,
                     "position_x_pred": float(vp[0]),
                     "position_y_pred": float(vp[1]),
                     "position_z_pred": float(vp[2]),
-                    "signal_score": ss,
+                    "signal_score": float(torch.sigmoid(signal_logit[i]).item()),
                 })
 
                 valid = int(cand_mask[i].sum().item())
-                att_i = att[i, :valid].detach().cpu().numpy() if valid>0 else np.zeros((0,))
-                qual_i = torch.sigmoid(qual_logit[i, :valid]).detach().cpu().numpy() if valid>0 else np.zeros((0,))
+                att_i = att[i, :valid].detach().cpu().numpy() if valid > 0 else np.zeros((0,))
+                qual_i = torch.sigmoid(qual_logit[i, :valid]).detach().cpu().numpy() if valid > 0 else np.zeros((0,))
                 ptr_logits_masked = ptr_logit[i].masked_fill(~cand_mask[i], very_neg)
-                ptr_i = int(torch.argmax(ptr_logits_masked).item()) if valid>0 else 0
+                ptr_i = int(torch.argmax(ptr_logits_masked).item()) if valid > 0 else 0
 
-                raw = cand_raw_list[i].numpy() if cand_raw_list[i].numel()>0 else np.zeros((0,5), dtype=np.float32)
+                raw = cand_raw_list[i].numpy() if cand_raw_list[i].numel() > 0 else np.zeros((0, 5), dtype=np.float32)
                 for j in range(min(valid, raw.shape[0])):
-                    vx,vy,vz,nh,sid = raw[j]
+                    vx, vy, vz, nh, sid = raw[j]
                     cands_rows.append({
                         "event_id": eid,
                         "cand_idx": j,
-                        "vx": float(vx), "vy": float(vy), "vz": float(vz),
+                        "vx": float(vx),
+                        "vy": float(vy),
+                        "vz": float(vz),
                         "n_hits": float(nh),
                         "scale_id": int(sid),
-                        "att_weight": float(att_i[j]) if j < len(att_i) else float('nan'),
-                        "qual_score": float(qual_i[j]) if j < len(qual_i) else float('nan'),
+                        "att_weight": float(att_i[j]) if j < len(att_i) else float("nan"),
+                        "qual_score": float(qual_i[j]) if j < len(qual_i) else float("nan"),
                         "is_pointer": int(j == ptr_i),
                     })
 
-                s = starts[i]; e = ends[i]
+                s = starts[i]
+                e = ends[i]
                 xyz = x_np[s:e, :3]
                 tvec = x_np[s:e, 3] if has_t else None
+
+                labels_local: np.ndarray | None = None
+                if node_truth_all is not None:
+                    labels_local = node_truth_all[s:e]
+                else:
+                    lookup_vals = label_lookup.get(eid)
+                    if lookup_vals is not None:
+                        if len(lookup_vals) < (e - s) and eid not in warned_events:
+                            print(
+                                f"[predict] signal_bkg length mismatch for event {eid}: dataset {e - s}, labels {len(lookup_vals)}"
+                            )
+                            warned_events.add(eid)
+                        labels_local = lookup_vals[: e - s]
+
                 sid = int(raw[ptr_i, 4]) if raw.shape[0] > 0 else 0
                 cfg = ms_cfg[sid]
                 Zfeat = _build_scaled_features(xyz, tvec, cfg, use_time=has_t)
-                labels = DBSCAN(eps=float(cfg.get("eps",0.5)), min_samples=int(cfg.get("min_samples",3))).fit_predict(Zfeat)
+                labels = DBSCAN(eps=float(cfg.get("eps", 0.5)), min_samples=int(cfg.get("min_samples", 3))).fit_predict(Zfeat)
 
                 uniq = np.unique(labels)
                 for tid in uniq:
@@ -852,12 +972,66 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
                     xs = xyz[idxs, 0].astype(float).tolist()
                     ys = xyz[idxs, 1].astype(float).tolist()
                     zs = xyz[idxs, 2].astype(float).tolist()
-                    ts = (tvec[idxs].astype(float).tolist() if has_t and tvec is not None else [float("nan")] * len(xs))
+                    ts = (
+                        tvec[idxs].astype(float).tolist()
+                        if has_t and tvec is not None
+                        else [float("nan")] * len(xs)
+                    )
+
+                    hit_labels: list[int] = []
+                    track_fraction = float("nan")
+                    max_idx = int(idxs.max()) if idxs.size > 0 else -1
+                    if labels_local is not None and max_idx < len(labels_local):
+                        local_hits = labels_local[idxs]
+                        hit_labels = [int(round(float(v))) for v in local_hits.tolist()]
+                        if len(local_hits) > 0:
+                            track_fraction = float(np.mean(local_hits))
+                    elif labels_local is not None and idxs.size > 0 and eid not in warned_events:
+                        print(f"[predict] signal_bkg missing hits for event {eid}, track {int(tid)}")
+                        warned_events.add(eid)
+
                     tracks_rows.append({
                         "event_id": eid,
                         "scale_id": sid,
-                        "track_id": int(tid),  # -1 = noise
-                        "x": xs, "y": ys, "z": zs, "t": ts,
+                        "track_id": int(tid),
+                        "x": xs,
+                        "y": ys,
+                        "z": zs,
+                        "t": ts,
+                        "hit_signal_bkg": hit_labels,
+                        "track_signal_fraction": track_fraction,
+                    })
+                    if tid >= 0 and not np.isnan(track_fraction):
+                        track_truth_map[(eid, int(tid))] = track_fraction
+
+                left = np.where(labels < 0)[0]
+                if left.size > 0:
+                    xs = xyz[left, 0].astype(float).tolist()
+                    ys = xyz[left, 1].astype(float).tolist()
+                    zs = xyz[left, 2].astype(float).tolist()
+                    ts = (
+                        tvec[left].astype(float).tolist()
+                        if has_t and tvec is not None
+                        else [float("nan")] * len(xs)
+                    )
+                    hit_labels = []
+                    track_fraction = float("nan")
+                    max_idx_left = int(left.max()) if left.size > 0 else -1
+                    if labels_local is not None and max_idx_left < len(labels_local):
+                        local_hits = labels_local[left]
+                        hit_labels = [int(round(float(v))) for v in local_hits.tolist()]
+                        if len(local_hits) > 0:
+                            track_fraction = float(np.mean(local_hits))
+                    tracks_rows.append({
+                        "event_id": eid,
+                        "scale_id": -1,
+                        "track_id": -1,
+                        "x": xs,
+                        "y": ys,
+                        "z": zs,
+                        "t": ts,
+                        "hit_signal_bkg": hit_labels,
+                        "track_signal_fraction": track_fraction,
                     })
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -866,15 +1040,37 @@ def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: 
     tracks_df = pd.DataFrame(tracks_rows)
     try:
         tracks_df.to_parquet(out_dir / "tracks_hits.parquet", index=False, engine="pyarrow")
-        # save per-track classification scores
-        if len(tracks_class_rows) > 0:
-            import pandas as pd, os
-            pd.DataFrame(tracks_class_rows).to_parquet(os.path.join(out_dir, "tracks_class.parquet"), index=False)
-
     except Exception:
         tracks_df.to_parquet(out_dir / "tracks_hits.parquet", index=False)
 
+    if tracks_class_rows:
+        for row in tracks_class_rows:
+            key = (row.get("event_id"), row.get("track_id"))
+            if key in track_truth_map:
+                row["track_signal_fraction"] = float(track_truth_map[key])
+        pd.DataFrame(tracks_class_rows).to_parquet(out_dir / "tracks_class.parquet", index=False)
+
     print(f"[predict] Saved → {out_dir}")
+
+
+def inference_and_export_tracks(
+    model: MultiTrackModel,
+    data_dir: str,
+    out_dir: Path,
+    use_time: bool,
+    detector: HIBEAM_Detector,
+    feature_list: list[str],
+    pulses_with_labels_path: str | None = None,
+):
+    return _inference_and_export_tracks_impl(
+        model=model,
+        data_dir=data_dir,
+        out_dir=out_dir,
+        use_time=use_time,
+        detector=detector,
+        feature_list=feature_list,
+        pulses_with_labels_path=pulses_with_labels_path,
+    )
 
 # ========================= PATCH: Robust clustering =========================
 # 多尺度聯合集群 + 自適應 eps + 小樣本友好 + robust 時間處理
@@ -1092,134 +1288,6 @@ def _cluster_multiscale_union(xyz: np.ndarray, tvec: np.ndarray | None, ms_cfg: 
                 final_clusters.append({"scale_id": c["scale_id"], "idxs": idxs[sp]})
     return final_clusters
 
-# 覆蓋輸出 tracks 的函式：改為「多尺度聯合集群 + 平行二分」，逐事件連號 track_id
-def inference_and_export_tracks(model: MultiTrackModel, data_dir: str, out_dir: Path, use_time: bool, graph_definition: KNNGraph):  # override
-    features = ["dom_x", "dom_y", "dom_z", "dom_t"] if use_time else ["dom_x", "dom_y", "dom_z"]
-    truth = ["position_x", "position_y", "position_z"]
-
-    dataset = ParquetDataset(
-        path=data_dir,
-        pulsemaps=["pulses"],
-        truth_table="truth",
-        features=features,
-        truth=truth,
-        data_representation=graph_definition,
-        index_column="event_id",
-    )
-    loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, persistent_workers=False)
-
-    ms_cfg = model.multiscale_cfg
-    preds_rows, cands_rows, tracks_rows = [], [], []
-    tracks_class_rows = []  # new: per-track signal scores
-
-    model.eval()
-    with torch.no_grad():
-        for batch in loader:
-            vertex_pred, signal_logit, aux = model(batch)
-
-            B = int(batch.num_graphs)
-            event_ids = batch.event_id.detach().cpu().numpy().tolist()
-            node_batch = batch.batch.detach().cpu().numpy()
-            x_np = batch.x.detach().cpu().numpy()
-            has_t = use_time and x_np.shape[1] >= 4
-
-            boundaries = np.where(np.diff(node_batch) != 0)[0] + 1
-            starts = np.concatenate([[0], boundaries])
-            ends = np.concatenate([boundaries, [len(node_batch)]])
-
-            att = aux["att_weights"]
-            qual_logit = aux["qual_logit"]
-            ptr_logit = aux["ptr_logit"]
-            cand_mask = aux["cand_mask"]
-            cand_raw_list = aux["cand_raw_list"]
-            very_neg = torch.finfo(ptr_logit.dtype).min / 2
-
-            for i in range(B):
-                eid = int(event_ids[i])
-                vp = vertex_pred[i].detach().cpu().numpy()
-                preds_rows.append({
-                    "event_id": eid,
-                    "position_x_pred": float(vp[0]),
-                    "position_y_pred": float(vp[1]),
-                    "position_z_pred": float(vp[2]),
-                    "signal_score": float(torch.sigmoid(signal_logit[i]).item()),
-                })
-
-                valid = int(cand_mask[i].sum().item())
-                att_i = att[i, :valid].detach().cpu().numpy() if valid > 0 else np.zeros((0,))
-                qual_i = torch.sigmoid(qual_logit[i, :valid]).detach().cpu().numpy() if valid > 0 else np.zeros((0,))
-                ptr_logits_masked = ptr_logit[i].masked_fill(~cand_mask[i], very_neg)
-                ptr_i = int(torch.argmax(ptr_logits_masked).item()) if valid > 0 else 0
-
-                raw = cand_raw_list[i].numpy() if cand_raw_list[i].numel() > 0 else np.zeros((0, 5), dtype=np.float32)
-                for j in range(min(valid, raw.shape[0])):
-                    vx, vy, vz, nh, sid = raw[j]
-                    cands_rows.append({
-                        "event_id": eid, "cand_idx": j,
-                        "vx": float(vx), "vy": float(vy), "vz": float(vz),
-                        "n_hits": float(nh), "scale_id": int(sid),
-                        "att_weight": float(att_i[j]) if j < len(att_i) else float("nan"),
-                        "qual_score": float(qual_i[j]) if j < len(qual_i) else float("nan"),
-                        "is_pointer": int(j == ptr_i),
-                    })
-
-                s, e = starts[i], ends[i]
-                xyz = x_np[s:e, :3]
-                tvec = x_np[s:e, 3] if has_t else None
-
-                # 多尺度 union + 正交二分
-                clusters = _cluster_multiscale_union(xyz, tvec, ms_cfg, use_time=has_t)
-
-                # 保底：仍無群 → 用超寬參數再試
-                if len(clusters) == 0:
-                    cfg0 = ms_cfg[0] if len(ms_cfg) else {"eps": 0.5, "min_samples": 3}
-                    Z0 = _build_scaled_features(xyz, tvec, cfg0, use_time=has_t)
-                    labels0 = DBSCAN(eps=max(2.5, float(cfg0.get("eps", 0.5)) * 3), min_samples=2).fit_predict(Z0)
-                    for tid in np.unique(labels0):
-                        if tid < 0:
-                            continue
-                        idxs = np.where(labels0 == tid)[0]
-                        if len(idxs) >= 2:
-                            clusters.append({"scale_id": 0, "idxs": idxs})
-
-                # 匯出：逐事件連號 track_id；未歸類 hits → -1（可視需要保留/拿走）
-                assigned = np.zeros(len(xyz), dtype=bool)
-                local_tid = 0
-                for c in clusters:
-                    idxs = c["idxs"]
-                    assigned[idxs] = True
-                    xs = xyz[idxs, 0].astype(float).tolist()
-                    ys = xyz[idxs, 1].astype(float).tolist()
-                    zs = xyz[idxs, 2].astype(float).tolist()
-                    ts = (tvec[idxs].astype(float).tolist() if (has_t and tvec is not None) else [float("nan")] * len(xs))
-                    tracks_rows.append({
-                        "event_id": eid,
-                        "scale_id": int(c["scale_id"]),
-                        "track_id": int(local_tid),
-                        "x": xs, "y": ys, "z": zs, "t": ts,
-                    })
-                    local_tid += 1
-
-                left = np.where(~assigned)[0]
-                if len(left) > 0:
-                    xs = xyz[left, 0].astype(float).tolist()
-                    ys = xyz[left, 1].astype(float).tolist()
-                    zs = xyz[left, 2].astype(float).tolist()
-                    ts = (tvec[left].astype(float).tolist() if (has_t and tvec is not None) else [float("nan")] * len(xs))
-                    tracks_rows.append({
-                        "event_id": eid, "scale_id": -1, "track_id": -1,
-                        "x": xs, "y": ys, "z": zs, "t": ts,
-                    })
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(preds_rows).to_parquet(out_dir / "predictions.parquet", index=False)
-    pd.DataFrame(cands_rows).to_parquet(out_dir / "candidates.parquet", index=False)
-    df_tracks = pd.DataFrame(tracks_rows)
-    try:
-        df_tracks.to_parquet(out_dir / "tracks_hits.parquet", index=False, engine="pyarrow")
-    except Exception:
-        df_tracks.to_parquet(out_dir / "tracks_hits.parquet", index=False)
-    print(f"[predict] Saved → {out_dir}")
 # ======================= END PATCH: Robust clustering =======================
 
 
@@ -1315,7 +1383,8 @@ def main():
             mul_tag=mul_tag,
             max_epochs=MAX_EPOCHS,
             folder=str(RESULTS_BASE),
-            use_time=USE_TIME,
+            use_time=PIPELINE_CONFIG.get("use_time", True),
+            config=PIPELINE_CONFIG,
         )
         
         print(f"[main] Saved outputs to: {out_dir}")
