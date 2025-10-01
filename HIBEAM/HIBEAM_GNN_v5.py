@@ -395,6 +395,7 @@ class MultiTrackModel(pl.LightningModule):
         self.signal_feature_index = None
         if feature_list and "signal_bkg" in feature_list:
             self.signal_feature_index = feature_list.index("signal_bkg")
+        self.expected_feature_dim = len(self.feature_list)
         self.coord_dims = 4 if use_time else 3
 
         # Backbone（與 v3 一致：DynEdge + 多種全域池化）
@@ -531,6 +532,7 @@ class MultiTrackModel(pl.LightningModule):
         else:
             batch = Batch.from_data_list([data])
 
+        batch = self._align_batch_features(batch)
         global_emb = self.backbone(batch)  # [B, Ge]
         cand_pad, cand_mask, cand_raw_list = self._candidates_forward(batch)
 
@@ -551,6 +553,34 @@ class MultiTrackModel(pl.LightningModule):
             "att_weights": att_w,
         }
         return vertex, signal_logit, aux
+
+    def _align_batch_features(self, batch: Batch) -> Batch:
+        expected = getattr(self, "expected_feature_dim", None)
+        if expected is None or expected <= 0:
+            return batch
+
+        actual = int(batch.x.shape[1])
+        if actual == expected:
+            return batch
+
+        if actual > expected:
+            if not hasattr(self, "_feature_width_warned"):
+                print(
+                    f"[model] Received {actual} features but expected {expected}; trimming extras to match training schema."
+                )
+                self._feature_width_warned = True
+            batch.x = batch.x[:, :expected]
+            return batch
+
+        pad_cols = expected - actual
+        if not hasattr(self, "_feature_width_warned"):
+            print(
+                f"[model] Received {actual} features but expected {expected}; padding {pad_cols} zero columns."
+            )
+            self._feature_width_warned = True
+        pad = batch.x.new_zeros(batch.x.shape[0], pad_cols)
+        batch.x = torch.cat([batch.x, pad], dim=1)
+        return batch
 
     def _build_candidate_targets(self, cand_raw_list: List[torch.Tensor], true_v: Tensor):
         quality_targets: List[Tensor] = []
